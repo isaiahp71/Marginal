@@ -311,7 +311,7 @@
   .highlight-layer{ pointer-events:none; }
   .highlight-layer .hl{
     position:absolute; pointer-events:auto; cursor:pointer;
-    mix-blend-mode:multiply; border-radius:2px;
+    mix-blend-mode:multiply; border-radius:2px; z-index:4;
   }
   .draw-layer{ pointer-events:none; z-index:3; }
   .search-flash{
@@ -1072,12 +1072,39 @@
       libraryLoadFailed = true;
     }
   }
+  // Keeps every open tab's in-memory library/folders in sync in real time.
+  // Without this, two tabs of the same page can each hold their own stale
+  // snapshot, and whichever one saves last silently overwrites the other's
+  // changes — this is what was causing PDFs/folders to "randomly vanish."
+  let syncChannel = null;
+  try{ syncChannel = new BroadcastChannel("marginal-sync"); } catch(e){ /* not supported in this browser */ }
+
+  async function refreshLibraryAndFoldersFromStorage(){
+    await loadLibraryManifest();
+    await loadFolders();
+    if ($("#libraryView").style.display !== "none") renderLibrary();
+  }
+  function broadcastChanged(){
+    if (syncChannel) try{ syncChannel.postMessage({ type: "changed" }); } catch(e){}
+  }
+  if (syncChannel){
+    syncChannel.onmessage = (e) => {
+      if (e && e.data && e.data.type === "changed") refreshLibraryAndFoldersFromStorage();
+    };
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") refreshLibraryAndFoldersFromStorage();
+  });
+
   async function saveLibraryManifest(){
     if (libraryLoadFailed){
       console.warn("Skipping library save: the last load failed, so saving now could overwrite real data with an empty list.");
       return;
     }
-    try{ await idbSet("marginal:library", state.library); }
+    try{
+      await idbSet("marginal:library", state.library);
+      broadcastChanged();
+    }
     catch(e){ console.warn("Could not save library index", e); }
   }
   function upsertLibraryMeta(meta){
@@ -1102,7 +1129,10 @@
       console.warn("Skipping folders save: the last load failed, so saving now could overwrite real data with an empty list.");
       return;
     }
-    try{ await idbSet("marginal:folders", state.folders); }
+    try{
+      await idbSet("marginal:folders", state.folders);
+      broadcastChanged();
+    }
     catch(e){ console.warn("Could not save folders", e); }
   }
   function folderName(id){
@@ -1655,9 +1685,14 @@
   }
 
   async function loadFileBytes(id){
-    const buf = await idbGet("marginal:file:" + id);
-    if (!buf) throw new Error("file bytes not found for " + id);
-    return buf;
+    for (let attempt = 1; attempt <= 3; attempt++){
+      try{
+        const buf = await idbGet("marginal:file:" + id);
+        if (buf) return buf;
+      } catch(e){ /* try again below */ }
+      if (attempt < 3) await new Promise(r => setTimeout(r, 250 * attempt));
+    }
+    throw new Error("file bytes not found for " + id);
   }
 
   async function openLibraryDoc(id, freshBuf, freshMeta){
@@ -1709,11 +1744,9 @@
     } catch(err){
       console.error(err);
       if (String((err && err.message) || "").includes("file bytes not found")){
-        state.library = state.library.filter(d => d.id !== id);
-        saveLibraryManifest();
-        alert("That PDF's data wasn't saved properly and has been removed from your library. Please upload it again.");
+        alert("Couldn't load this PDF's data right now — it's still in your library. Please try opening it again in a moment; if it keeps failing, you can remove it manually.");
       } else {
-        alert("Couldn't open that PDF. It may be corrupted or removed from storage.");
+        alert("Couldn't open that PDF. It may be corrupted, or there was a temporary problem reading it — please try again.");
       }
       showLibrary();
     } finally{
